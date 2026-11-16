@@ -398,9 +398,10 @@ pub fn serve(mut conn: File, paths: &Paths) -> io::Result<()> {
                 },
                 Ok(Msg::Exec(spec)) => {
                     let target = procs.values().find(|p| p.run.container.is_none() && p.run.id == spec.container_id);
-                    match target.map(|p| p.run.pid) {
+                    // The container's own seccomp profile, if it has one.
+                    match target.map(|p| (p.run.pid, p.run.seccomp.clone())) {
                         None => Msg::Error(&format!("container {} is not running", spec.container_id)).encode(&mut out),
-                        Some(pid) => match container::exec(&spec, pid, paths) {
+                        Some((pid, profile)) => match container::exec(&spec, pid, paths, &profile) {
                             Ok(run) => {
                                 let cloned_ns = sys::boottime_ns();
                                 Msg::Started { id: &run.id, pid: run.pid as u32 }.encode(&mut out);
