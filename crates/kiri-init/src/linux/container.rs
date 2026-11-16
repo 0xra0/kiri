@@ -1366,6 +1366,18 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
     }
     .unwrap_or_else(|e| fail("seccomp", e));
     let (uid, gid) = resolve_user(&p.user).unwrap_or_else(|e| fail("user", e));
+    // Docker creates a missing working directory (mkdir -p) as root, 0755,
+    // before it switches user, so a non-root container can still enter it
+    // (#370). A failure shows up as the chdir's error below.
+    if uid != 0 {
+        // SAFETY: `p.cwd` is a NUL-terminated path we own.
+        if unsafe { libc::access(p.cwd.as_ptr(), libc::F_OK) } != 0 {
+            use std::os::unix::fs::DirBuilderExt;
+            // SAFETY: the bytes came from a &str, so they are valid UTF-8.
+            let dir = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(p.cwd.as_bytes()) };
+            let _ = fs::DirBuilder::new().recursive(true).mode(0o755).create(dir);
+        }
+    }
     // The user's /etc/group memberships and --group-add, as Docker gives them.
     let groups = super::hostopts::supplementary_groups(&p.user, uid, &p.host.groups).unwrap_or_else(|e| fail("groups", e));
     give_stdio([0, 1, 2], uid).unwrap_or_else(|e| fail("stdio", e));
