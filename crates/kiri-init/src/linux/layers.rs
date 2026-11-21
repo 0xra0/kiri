@@ -5,7 +5,7 @@
 //! a VM that stops before the guest flushes can keep a layer's names but
 //! lose its contents, leaving every file empty.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{self, BufReader, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -206,6 +206,8 @@ fn untar_in(reader: impl Read, dest: &Path, detect_userns: fn() -> bool) -> io::
             let root = inroot::open_root(dest)?;
             let (from, source) = hardlink_parent(root.as_fd(), &source)?;
             let (to, name) = hardlink_parent(root.as_fd(), &path)?;
+            // What an earlier entry left at this path goes, as in Docker.
+            clear(to.as_fd(), &name)?;
             // SAFETY: parents are confined directory fds and names are NUL-terminated.
             // Flags 0 links the symlink itself, without following its absolute target.
             let ret = unsafe { libc::linkat(from.as_raw_fd(), source.as_ptr(), to.as_raw_fd(), name.as_ptr(), 0) };
@@ -217,10 +219,20 @@ fn untar_in(reader: impl Read, dest: &Path, detect_userns: fn() -> bool) -> io::
             // if refused.
             let userns = *userns.get_or_insert_with(detect_userns);
             if userns && kind != libc::S_IFIFO {
-                continue;
+                // Docker removes what is at the path before leaving it out,
+                // and carries on when there is no such path: a parent that
+                // is a file, or a symlink loop.
+                let cleared = inroot::open_root(dest).and_then(|root| {
+                    let (parent, name) = hardlink_parent(root.as_fd(), &path)?;
+                    clear(parent.as_fd(), &name)
+                });
+                match cleared {
+                    Err(e) if !not_dir_or_loop(&e) => return Err(e),
+                    _ => continue,
+                }
             }
             make_special(dest, &path, entry.header(), kind, userns)?;
-        } else if entry.unpack_in(dest)? {
+        } else if unpack_replacing(&mut entry, dest, &path)? {
             keep_zero_time(dest, &path, entry.header())?;
             if entry.header().entry_type().is_dir()
                 && let Ok(mtime) = entry.header().mtime()
@@ -382,7 +394,7 @@ fn make_special(dest: &Path, path: &Path, h: &tar::Header, kind: libc::mode_t, m
     let t = [libc::timespec { tv_sec: mtime, tv_nsec: 0 }, libc::timespec { tv_sec: mtime, tv_nsec: 0 }];
     // SAFETY: a confined parent descriptor and a single NUL-terminated name.
     unsafe {
-        libc::unlinkat(p, name.as_ptr(), 0);
+        clear(parent.as_fd(), &name)?;
         if libc::mknodat(p, name.as_ptr(), kind | mode, dev) != 0 {
             let e = io::Error::last_os_error();
             if may_be_refused && e.raw_os_error() == Some(libc::EPERM) {
@@ -478,6 +490,171 @@ fn whiteout_dir(dest: &Path, parent: &Path) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Unpacks `entry` as the tar crate does, which already replaces one file
+/// or symlink with another, and also when an earlier entry of the layer
+/// left a directory where this one isn't, or something else where this one
+/// is a directory: as Docker does, the directory goes for the file, and the
+/// file for the directory, while a directory over a directory is merged.
+/// Only looked into once the tar crate fails, and only when it failed on
+/// what is at the path (not on a path that leads outside the layer, or
+/// can't be looked up), so the usual entry costs nothing more.
+fn unpack_replacing<R: Read>(entry: &mut tar::Entry<'_, R>, dest: &Path, path: &Path) -> io::Result<bool> {
+    let err = match entry.unpack_in(dest) {
+        Ok(unpacked) => return Ok(unpacked),
+        Err(e) => e,
+    };
+    if !matches!(err.kind(), io::ErrorKind::AlreadyExists | io::ErrorKind::IsADirectory | io::ErrorKind::NotADirectory) {
+        return Err(err);
+    }
+    let is_dir = entry.header().entry_type().is_dir();
+    match replace_other_kind(dest, path, is_dir) {
+        Ok(true) => entry.unpack_in(dest),
+        Ok(false) => Err(err),
+        Err(e) => Err(io::Error::new(e.kind(), format!("replacing {}: {e}", path.display()))),
+    }
+}
+
+/// Removes what is at `path` inside the layer when it is a directory and
+/// the entry for it isn't, or the other way round; says whether it did.
+fn replace_other_kind(dest: &Path, path: &Path, is_dir: bool) -> io::Result<bool> {
+    let root = inroot::open_root(dest)?;
+    let (parent, name) = hardlink_parent(root.as_fd(), path)?;
+    match kind_at(parent.as_fd(), &name)? {
+        Some(was_dir) if was_dir != is_dir => {
+            clear(parent.as_fd(), &name)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Whether `name` in `parent` is a directory (not following a symlink), or
+/// None when nothing is there.
+fn kind_at(parent: BorrowedFd<'_>, name: &CStr) -> io::Result<Option<bool>> {
+    // SAFETY: stat is plain data (all-zero is valid); a valid directory
+    // descriptor and a NUL-terminated name.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstatat(parent.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) != 0 {
+            let e = io::Error::last_os_error();
+            return if e.raw_os_error() == Some(libc::ENOENT) { Ok(None) } else { Err(e) };
+        }
+        Ok(Some(st.st_mode & libc::S_IFMT == libc::S_IFDIR))
+    }
+}
+
+/// Removes whatever is at `name` in `parent`: a directory with all in it,
+/// anything else unlinked. Nothing there is fine.
+fn clear(parent: BorrowedFd<'_>, name: &CStr) -> io::Result<()> {
+    match kind_at(parent, name)? {
+        None => Ok(()),
+        Some(true) => remove_tree(parent, name, 0),
+        Some(false) => {
+            // SAFETY: a valid directory descriptor and a NUL-terminated name.
+            sys::check(unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } as _, "remove").map(drop)
+        }
+    }
+}
+
+/// Whether `e` is ENOTDIR or ELOOP, also after a lookup put its path in it.
+fn not_dir_or_loop(e: &io::Error) -> bool {
+    [libc::ENOTDIR, libc::ELOOP].into_iter().any(|code| e.raw_os_error() == Some(code) || e.kind() == io::Error::from_raw_os_error(code).kind())
+}
+
+/// How deep a directory being replaced may go: each level holds one
+/// descriptor while what is in it goes. A deeper one fails the layer.
+const REMOVE_DEPTH: usize = 128;
+
+/// Removes directory `name` in `parent` and all in it, through descriptors
+/// alone: every directory is opened with O_NOFOLLOW from the one above, so
+/// a symlink inside is removed, never followed, and /proc isn't needed. A
+/// directory on another filesystem than the one above it (a mount) is an
+/// error, before anything in it goes.
+fn remove_tree(parent: BorrowedFd<'_>, name: &CStr, depth: usize) -> io::Result<()> {
+    if depth >= REMOVE_DEPTH {
+        return Err(io::Error::other("directory too deep to replace"));
+    }
+    // A second pass in case the listing missed a name while names went.
+    for pass in 0..2 {
+        empty_dir(parent, name, depth)?;
+        // SAFETY: a valid directory descriptor and a NUL-terminated name.
+        let ret = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+        if ret == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if pass == 1 || e.raw_os_error() != Some(libc::ENOTEMPTY) {
+            return Err(io::Error::new(e.kind(), format!("remove directory: {e}")));
+        }
+    }
+    unreachable!("the second pass returns")
+}
+
+/// The filesystem `fd` is on.
+fn device(fd: BorrowedFd<'_>) -> io::Result<libc::dev_t> {
+    // SAFETY: stat is plain data (all-zero is valid); fstat fills it from a
+    // valid descriptor.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        sys::check(libc::fstat(fd.as_raw_fd(), &mut st) as _, "stat directory")?;
+        Ok(st.st_dev)
+    }
+}
+
+/// Removes everything in directory `name` in `parent` (see [`remove_tree`]).
+fn empty_dir(parent: BorrowedFd<'_>, name: &CStr, depth: usize) -> io::Result<()> {
+    // SAFETY: a valid directory descriptor and a NUL-terminated name.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    sys::check(fd as _, "open directory")?;
+    // SAFETY: a fresh directory descriptor; the stream owns it from here.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let e = io::Error::last_os_error();
+        // SAFETY: the descriptor the stream did not take.
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    // SAFETY: the stream keeps `fd` open until closedir below.
+    let dir = unsafe { BorrowedFd::borrow_raw(fd) };
+    if device(dir)? != device(parent)? {
+        // SAFETY: the stream opened above, closed once (with its descriptor).
+        unsafe { libc::closedir(stream) };
+        return Err(io::Error::other("a mount inside the directory to replace"));
+    }
+    let result = (|| loop {
+        // SAFETY: errno is this thread's; readdir reads a valid open stream
+        // and sets errno only on failure.
+        let ent = unsafe {
+            *libc::__errno_location() = 0;
+            libc::readdir(stream)
+        };
+        if ent.is_null() {
+            let e = io::Error::last_os_error();
+            return if e.raw_os_error().unwrap_or(0) == 0 { Ok(()) } else { Err(e) };
+        }
+        // SAFETY: readdir's entry stays valid until the next call on this
+        // stream; the name is copied out first.
+        let (child, kind) = unsafe { (CStr::from_ptr((*ent).d_name.as_ptr()).to_owned(), (*ent).d_type) };
+        if matches!(child.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let is_dir = match kind {
+            libc::DT_DIR => true,
+            libc::DT_UNKNOWN => kind_at(dir, &child)? == Some(true),
+            _ => false,
+        };
+        if is_dir {
+            remove_tree(dir, &child, depth + 1)?;
+        } else {
+            // SAFETY: a valid directory descriptor and a NUL-terminated name.
+            sys::check(unsafe { libc::unlinkat(dir.as_raw_fd(), child.as_ptr(), 0) } as _, "remove")?;
+        }
+    })();
+    // SAFETY: the stream opened above, closed once (with its descriptor).
+    unsafe { libc::closedir(stream) };
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +676,230 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn a_path_named_again_as_another_kind_takes_the_later_entry() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+        // As Docker's archive.Unpack: what is at the path goes, unless both
+        // are directories, which merge.
+        let mut b = tar::Builder::new(Vec::new());
+        let mut add = |path: &str, kind: tar::EntryType, link: Option<&str>, data: &[u8]| {
+            let mut h = header(data.len() as u64, if kind.is_symlink() { 0o777 } else { 0o755 });
+            h.set_entry_type(kind);
+            h.set_mtime(1_000_000);
+            match link {
+                Some(to) => b.append_link(&mut h, path, to).unwrap(),
+                None => {
+                    h.set_cksum();
+                    b.append_data(&mut h, path, data).unwrap();
+                }
+            }
+        };
+        use tar::EntryType::{Directory as D, Fifo, Link, Regular as F, Symlink as S};
+        // A directory with a file in it, then a file.
+        add("swap1", D, None, b"");
+        add("swap1/inner", F, None, b"old");
+        add("swap1", F, None, b"new");
+        // A symlink (to a directory outside), then a directory.
+        add("swap2", S, Some("/srv"), b"");
+        add("swap2", D, None, b"");
+        add("swap2/in", F, None, b"in");
+        // A file, then a directory.
+        add("swap3", F, None, b"x");
+        add("swap3", D, None, b"");
+        // A directory, then a symlink: the symlink, as in Docker (which also
+        // sets the gone directory's time on the link's target; here the
+        // target is left alone).
+        add("swap4", D, None, b"");
+        add("swap4/inner", F, None, b"");
+        add("swap4", S, Some("swap1"), b"");
+        // A directory, then a hard link; a file, then a hard link.
+        add("swap5", D, None, b"");
+        add("swap5/inner", F, None, b"");
+        add("swap5", Link, Some("swap1"), b"");
+        add("swap6", F, None, b"other");
+        add("swap6", Link, Some("swap1"), b"");
+        // A directory, then a fifo.
+        add("swap7", D, None, b"");
+        add("swap7/inner", F, None, b"");
+        add("swap7", Fifo, None, b"");
+        // A directory twice: merged, the first one's file kept.
+        add("keep", D, None, b"");
+        add("keep/a", F, None, b"a");
+        add("keep", D, None, b"");
+        let bytes = b.into_inner().unwrap();
+
+        let dest = scratch("retype");
+        untar_in(Capped { inner: &bytes[..], left: u64::MAX }, &dest, || false).unwrap();
+        let meta = |p: &str| fs::symlink_metadata(dest.join(p)).unwrap();
+        assert_eq!(fs::read(dest.join("swap1")).unwrap(), b"new");
+        assert!(meta("swap2").is_dir() && meta("swap2/in").is_file());
+        assert!(meta("swap3").is_dir());
+        assert_eq!(fs::read_link(dest.join("swap4")).unwrap(), Path::new("swap1"));
+        assert_eq!(meta("swap5").ino(), meta("swap1").ino());
+        assert_eq!(meta("swap6").ino(), meta("swap1").ino());
+        assert!(meta("swap7").file_type().is_fifo());
+        assert_eq!(fs::read(dest.join("keep/a")).unwrap(), b"a");
+        fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn a_retype_stays_inside_the_layer() {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut add = |path: &str, kind: tar::EntryType, link: Option<&str>| {
+            let mut h = header(0, if kind.is_symlink() { 0o777 } else { 0o755 });
+            h.set_entry_type(kind);
+            match link {
+                Some(to) => b.append_link(&mut h, path, to).unwrap(),
+                None => {
+                    h.set_cksum();
+                    b.append_data(&mut h, path, io::empty()).unwrap();
+                }
+            }
+        };
+        use tar::EntryType::{Directory as D, Regular as F, Symlink as S};
+        // A file under a parent that is an absolute symlink: the tar crate
+        // refuses it (the link leads off the layer), and what the link would
+        // name inside the layer stays.
+        add("real", D, None);
+        add("real/x", D, None);
+        add("real/x/keep", F, None);
+        add("lnk", S, Some("/real"));
+        add("lnk/x", F, None);
+        let bytes = b.into_inner().unwrap();
+        let dest = scratch("retype-abs-parent");
+        assert!(untar_in(Capped { inner: &bytes[..], left: u64::MAX }, &dest, || false).is_err());
+        assert!(dest.join("real/x/keep").is_file());
+        fs::remove_dir_all(dest).unwrap();
+
+        // Under a relative symlink inside the layer, as in Docker: the
+        // directory it reaches goes for the file.
+        let mut b = tar::Builder::new(Vec::new());
+        let mut add = |path: &str, kind: tar::EntryType, link: Option<&str>| {
+            let mut h = header(0, if kind.is_symlink() { 0o777 } else { 0o755 });
+            h.set_entry_type(kind);
+            match link {
+                Some(to) => b.append_link(&mut h, path, to).unwrap(),
+                None => {
+                    h.set_cksum();
+                    b.append_data(&mut h, path, io::empty()).unwrap();
+                }
+            }
+        };
+        add("real", D, None);
+        add("real/x", D, None);
+        add("real/x/keep", F, None);
+        add("lnk", S, Some("real"));
+        add("lnk/x", F, None);
+        let bytes = b.into_inner().unwrap();
+        let dest = scratch("retype-rel-parent");
+        untar_in(Capped { inner: &bytes[..], left: u64::MAX }, &dest, || false).unwrap();
+        assert!(fs::symlink_metadata(dest.join("real/x")).unwrap().is_file());
+        fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn a_replaced_directory_goes_without_following_links() {
+        // Outside the layer: a directory its symlinks point to.
+        let outside = scratch("retype-outside");
+        fs::write(outside.join("keep"), b"keep").unwrap();
+        let dest = scratch("retype-tree");
+        let mut deep = dest.join("d");
+        fs::create_dir(&deep).unwrap();
+        std::os::unix::fs::symlink(&outside, deep.join("abs")).unwrap();
+        for i in 0..40 {
+            deep.push(format!("{i}"));
+            fs::create_dir(&deep).unwrap();
+            fs::write(deep.join("f"), b"f").unwrap();
+            std::os::unix::fs::symlink(&outside, deep.join("out")).unwrap();
+        }
+        let root = inroot::open_root(&dest).unwrap();
+        clear(root.as_fd(), c"d").unwrap();
+        assert!(!dest.join("d").exists());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"keep");
+
+        // Deeper than a removal goes: an error, not a run out of descriptors.
+        let mut deep = dest.join("e");
+        for _ in 0..REMOVE_DEPTH + 2 {
+            fs::create_dir(&deep).unwrap();
+            deep.push("n");
+        }
+        assert!(clear(root.as_fd(), c"e").is_err());
+        drop(root);
+        fs::remove_dir_all(dest).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn a_device_left_out_in_a_user_namespace_still_replaces() {
+        // Docker removes the directory, then leaves the device out.
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = header(0, 0o755);
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_cksum();
+        b.append_data(&mut h, "dev", io::empty()).unwrap();
+        b.append_data(&mut header(1, 0o644), "dev/x", &b"x"[..]).unwrap();
+        let mut h = header(0, 0o666);
+        h.set_entry_type(tar::EntryType::Char);
+        h.set_device_major(1).unwrap();
+        h.set_device_minor(3).unwrap();
+        h.set_cksum();
+        b.append_data(&mut h, "dev", io::empty()).unwrap();
+        let bytes = b.into_inner().unwrap();
+        let dest = scratch("retype-userns");
+        untar_in(Capped { inner: &bytes[..], left: u64::MAX }, &dest, || true).unwrap();
+        assert!(fs::symlink_metadata(dest.join("dev")).is_err());
+        fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn a_device_left_out_under_a_file_or_a_loop_is_skipped() {
+        // Docker finds no such path and carries on.
+        let mut b = tar::Builder::new(Vec::new());
+        b.append_data(&mut header(1, 0o644), "pf", &b"x"[..]).unwrap();
+        let mut h = header(0, 0o777);
+        h.set_entry_type(tar::EntryType::Symlink);
+        b.append_link(&mut h, "lp", "lp").unwrap();
+        for path in ["pf/dev", "lp/dev"] {
+            let mut h = header(0, 0o666);
+            h.set_entry_type(tar::EntryType::Char);
+            h.set_device_major(1).unwrap();
+            h.set_device_minor(3).unwrap();
+            h.set_cksum();
+            b.append_data(&mut h, path, io::empty()).unwrap();
+        }
+        b.append_data(&mut header(1, 0o644), "after", &b"a"[..]).unwrap();
+        let bytes = b.into_inner().unwrap();
+        let dest = scratch("retype-userns-skip");
+        untar_in(Capped { inner: &bytes[..], left: u64::MAX }, &dest, || true).unwrap();
+        assert_eq!(fs::read(dest.join("pf")).unwrap(), b"x");
+        assert!(dest.join("after").is_file());
+        fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn a_replaced_directory_does_not_reach_into_a_mount() {
+        let dest = scratch("retype-mount");
+        fs::create_dir_all(dest.join("d/m")).unwrap();
+        fs::write(dest.join("d/f"), b"f").unwrap();
+        let m = sys::cstr(dest.join("d/m")).unwrap();
+        // SAFETY: NUL-terminated strings.
+        if unsafe { libc::mount(c"tmpfs".as_ptr(), m.as_ptr(), c"tmpfs".as_ptr(), 0, std::ptr::null()) } != 0 {
+            eprintln!("skipped: no tmpfs mount here ({})", io::Error::last_os_error());
+            fs::remove_dir_all(dest).unwrap();
+            return;
+        }
+        fs::write(dest.join("d/m/keep"), b"keep").unwrap();
+        let root = inroot::open_root(&dest).unwrap();
+        let err = clear(root.as_fd(), c"d").unwrap_err();
+        assert!(err.to_string().contains("mount"), "{err}");
+        assert_eq!(fs::read(dest.join("d/m/keep")).unwrap(), b"keep");
+        // SAFETY: a NUL-terminated path.
+        unsafe { libc::umount(m.as_ptr()) };
+        drop(root);
+        fs::remove_dir_all(dest).unwrap();
     }
 
     #[test]
