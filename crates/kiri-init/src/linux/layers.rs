@@ -172,9 +172,15 @@ fn untar_in(reader: impl Read, dest: &Path, detect_userns: fn() -> bool) -> io::
     archive.set_unpack_xattrs(true);
     archive.set_overwrite(true);
     let mut total = 0u64;
+    // Each folder's time from its entry, set once everything is in: a
+    // file or whiteout made in it later would change it again.
+    let mut dir_times: Vec<(PathBuf, i64)> = Vec::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
+        if entry.header().entry_type().is_dir() {
+            dir_times.push((path.clone(), entry.header().mtime().unwrap_or(0) as i64));
+        }
         let name = path.file_name().map(|n| n.as_bytes()).unwrap_or_default();
         if let Some(hidden) = name.strip_prefix(b".wh.") {
             // `.wh.`, `.wh..` and `.wh...` would hide the directory itself or its parent.
@@ -221,6 +227,7 @@ fn untar_in(reader: impl Read, dest: &Path, detect_userns: fn() -> bool) -> io::
             keep_zero_time(dest, &path, entry.header())?;
         }
     }
+    set_dir_times(dest, &dir_times)?;
     Ok(total)
 }
 
@@ -313,6 +320,21 @@ pub(crate) fn keep_zero_time(dest: &Path, path: &Path, h: &tar::Header) -> io::R
     let t = [libc::timespec { tv_sec: 0, tv_nsec: 0 }, libc::timespec { tv_sec: 0, tv_nsec: 0 }];
     // SAFETY: a confined parent descriptor, a NUL-terminated name and two timespecs.
     sys::check(unsafe { libc::utimensat(parent.as_raw_fd(), name.as_ptr(), t.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) } as _, "set time")?;
+    Ok(())
+}
+
+/// Sets each folder's mtime (and atime), looked up inside `dest`.
+fn set_dir_times(dest: &Path, times: &[(PathBuf, i64)]) -> io::Result<()> {
+    if times.is_empty() {
+        return Ok(());
+    }
+    let root = inroot::open_root(dest)?;
+    for (rel, secs) in times {
+        let Ok(at) = inroot::open(root.as_fd(), rel, inroot::Last::Exists) else { continue };
+        let t = [libc::timespec { tv_sec: *secs, tv_nsec: 0 }, libc::timespec { tv_sec: *secs, tv_nsec: 0 }];
+        // SAFETY: a valid NUL-terminated path (the descriptor's magic link) and two timespecs.
+        sys::check(unsafe { libc::utimensat(libc::AT_FDCWD, at.proc_path().as_ptr(), t.as_ptr(), 0) } as _, "set folder time")?;
+    }
     Ok(())
 }
 
@@ -883,6 +905,41 @@ mod tests {
         untar(Capped { inner: &bytes[..], left: u64::MAX }, &dest).unwrap();
         let t = |p: &str| fs::symlink_metadata(dest.join(p)).unwrap().mtime();
         assert_eq!((t("f"), t("l"), t("g")), (0, 0, 5));
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// A folder keeps the time its entry gives, though files and whiteouts
+    /// unpacked into it after the entry changed it: Docker's containers
+    /// see the image's folder times, not the time of the unpack.
+    #[test]
+    fn a_folder_keeps_its_entrys_time() {
+        use std::os::unix::fs::MetadataExt;
+        let mut b = tar::Builder::new(Vec::new());
+        let mut d = header(0, 0o755);
+        d.set_entry_type(tar::EntryType::Directory);
+        d.set_mtime(1_600_000_000);
+        d.set_cksum();
+        b.append_data(&mut d, "d/", &[][..]).unwrap();
+        let mut f = header(1, 0o644);
+        f.set_mtime(1_700_000_000);
+        f.set_cksum();
+        b.append_data(&mut f, "d/f", &b"x"[..]).unwrap();
+        b.append_data(&mut d, "e/", &[][..]).unwrap();
+        b.append_data(&mut header(0, 0o644), "e/.wh.gone", &[][..]).unwrap();
+        let bytes = b.into_inner().unwrap();
+        let dest = scratch("folder-times");
+        // SAFETY: a plain getter.
+        let root = unsafe { libc::geteuid() } == 0;
+        let result = untar(Capped { inner: &bytes[..], left: u64::MAX }, &dest);
+        if !root && result.is_err() {
+            // A whiteout is a device node: only root makes one.
+            eprintln!("skipped: needs root for the whiteout");
+            let _ = fs::remove_dir_all(&dest);
+            return;
+        }
+        result.unwrap();
+        let t = |p: &str| fs::metadata(dest.join(p)).unwrap().mtime();
+        assert_eq!((t("d"), t("d/f"), t("e")), (1_600_000_000, 1_700_000_000, 1_600_000_000));
         let _ = fs::remove_dir_all(&dest);
     }
 
