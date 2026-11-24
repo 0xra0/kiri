@@ -184,7 +184,7 @@ Kiri's own commands:
 | `kiri k8s start \| stop \| status \| delete` | A single-node Kubernetes cluster |
 | `kiri machine create NAME [--distro D] \| list \| shell NAME \| stop \| delete NAME` | Linux machines |
 | `kiri share PORT\|CONTAINER [--name N]` | Share a local port or container on the internet |
-| `kiri import [orbstack \| desktop-linux]` | Bring images, volumes and containers over |
+| `kiri import [orbstack \| desktop-linux \| docker]` | Bring images, volumes and containers over (`docker`: Linux's own Docker Engine) |
 | `kiri domains [set --http N --https N \| reset]` | The ports local domains answer on |
 | `kiri usb [list] \| attach DEVICE \| detach DEVICE` | USB devices for containers (beta) |
 | `kiri build-with [docker \| kiri]` | Which builder `docker build` uses |

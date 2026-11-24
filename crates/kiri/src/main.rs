@@ -46,7 +46,8 @@ mod images;
 mod guest;
 #[cfg(target_os = "linux")]
 mod hostaccess;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(not(any(target_os = "macos", feature = "window")), allow(dead_code))]
 mod import;
 #[cfg(unix)]
 mod k8s;
@@ -99,7 +100,7 @@ usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
        kiri k8s start [--use] | stop | status | delete | set [--lan on|off] [--tls-san NAME,…] [--port N]
        kiri usb [list] | attach DEVICE | detach DEVICE   USB devices for containers, beta (Mac: pass through to the VM)
        kiri machine create NAME [--distro D] | list | shell NAME | stop | delete NAME
-       kiri import [orbstack | desktop-linux] [--list | [--force] [image|volume|container NAME]]
+       kiri import [orbstack | desktop-linux | docker] [--list | [--force] [image|volume|container NAME]]
        kiri bench [--runs N] [--image IMAGE] [--network none|bridge]
        kiri boot [--console] [--pings N]
        kiri raw run [--rm] [-e KEY=VALUE]... IMAGE [COMMAND...]   (its own guest, no daemon)
@@ -173,7 +174,7 @@ fn main() -> ExitCode {
         Some("machine") => machine::run(&args[1..]),
         #[cfg(unix)]
         Some("usb") => usb::run(&args[1..]),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         Some("import") => import::run(&args[1..]),
         #[cfg(target_os = "macos")]
         Some("update") if !docker::is_container_update(&args[1..]) => update::run(&args[1..]),

@@ -1,4 +1,4 @@
-//! Moving to Kiri from OrbStack or Docker Desktop: images, volumes and
+//! Moving to Kiri from OrbStack, Docker Desktop or (Linux) Docker Engine: images, volumes and
 //! containers, copied through the docker CLI so each engine speaks its own
 //! API. The source is only read: `docker save` for images, `inspect` for
 //! containers, and for a volume `docker cp` out of a container that mounts
@@ -15,8 +15,25 @@ use serde_json::{Value, json};
 use crate::client;
 
 /// The engines Kiri can import from: docker context name, label. Docker
-/// Desktop's context has the same name on Windows; OrbStack is Mac-only.
-pub const SOURCES: &[(&str, &str)] = if cfg!(windows) { &[("desktop-linux", "Docker Desktop")] } else { &[("orbstack", "OrbStack"), ("desktop-linux", "Docker Desktop")] };
+/// Desktop's context has the same name on Windows; OrbStack is Mac-only;
+/// Docker Engine ([`ENGINE`]) is Linux's own dockerd, which has no context.
+pub const SOURCES: &[(&str, &str)] = if cfg!(windows) {
+    &[("desktop-linux", "Docker Desktop")]
+} else if cfg!(target_os = "linux") {
+    &[("orbstack", "OrbStack"), ("desktop-linux", "Docker Desktop"), (ENGINE, "Docker Engine")]
+} else {
+    &[("orbstack", "OrbStack"), ("desktop-linux", "Docker Desktop")]
+};
+
+/// Linux's dockerd, reached at its socket: the `default` context follows
+/// DOCKER_HOST, and is Kiri itself once Kiri has /var/run/docker.sock.
+const ENGINE: &str = "docker";
+const ENGINE_SOCK: &str = "/var/run/docker.sock";
+
+/// The docker CLI's flags that reach `ctx`.
+fn on(ctx: &str) -> [&str; 2] {
+    if ctx == ENGINE { ["--host", "unix:///var/run/docker.sock"] } else { ["--context", ctx] }
+}
 
 // kiri-win builds this file too, where docker_cli() gives a String.
 #[allow(clippy::useless_conversion)]
@@ -45,7 +62,7 @@ fn known(source: &str) -> io::Result<&'static str> {
 
 /// `docker --context ctx <args>`, its output as JSON lines.
 fn json_lines(ctx: &str, args: &[&str]) -> io::Result<Vec<Value>> {
-    let out = cli()?.arg("--context").arg(ctx).args(args).stderr(Stdio::piped()).output()?;
+    let out = cli()?.args(on(ctx)).args(args).stderr(Stdio::piped()).output()?;
     if !out.status.success() {
         return Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_owned()));
     }
@@ -55,7 +72,7 @@ fn json_lines(ctx: &str, args: &[&str]) -> io::Result<Vec<Value>> {
 /// [`json_lines`] for `inspect` of several: what was found, though one of
 /// them is gone (docker then fails, having printed the others).
 fn json_lines_found(ctx: &str, args: &[&str]) -> io::Result<Vec<Value>> {
-    let out = cli()?.arg("--context").arg(ctx).args(args).stderr(Stdio::piped()).output()?;
+    let out = cli()?.args(on(ctx)).args(args).stderr(Stdio::piped()).output()?;
     let found: Vec<Value> = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
     // Only "No such ..." is a container that went; any other failure is one.
     let said = String::from_utf8_lossy(&out.stderr);
@@ -169,7 +186,7 @@ fn image_names(ctx: &str) -> io::Result<Vec<String>> {
 
 /// Whether `ctx` has the image, container or volume `name`.
 fn has(ctx: &str, kind: &str, name: &str) -> bool {
-    cli().is_ok_and(|mut c| c.args(["--context", ctx, kind, "inspect", name]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()))
+    cli().is_ok_and(|mut c| c.args(on(ctx)).args([kind, "inspect", name]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()))
 }
 
 /// `from` piped through `retar` (in this process) into `to`, both docker
@@ -238,9 +255,9 @@ fn pipe(mut from: Command, mut to: Command, from_ctx: &str, retar: impl FnOnce(&
 pub fn image(source: &str, name: &str) -> io::Result<()> {
     let ctx = known(source)?;
     let mut save = cli()?;
-    save.args(["--context", ctx, "save", name]);
+    save.args(on(ctx)).args(["save", name]);
     let mut load = cli()?;
-    load.args(["--context", crate::flavor::CONTEXT.get(), "load", "-q"]);
+    load.args(on(crate::flavor::CONTEXT.get())).args(["load", "-q"]);
     let named = name.contains('@').then_some(name);
     pipe(save, load, ctx, |from, to| retar(from, to, named))
 }
@@ -418,7 +435,7 @@ fn helper() -> io::Result<String> {
         return Err(none());
     }
     let kiri = crate::flavor::CONTEXT.get();
-    let pull = |name: &str| cli().is_ok_and(|mut c| c.args(["--context", kiri, "pull", "-q", name]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()));
+    let pull = |name: &str| cli().is_ok_and(|mut c| c.args(on(kiri)).args(["pull", "-q", name]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()));
     if (pull("mirror.gcr.io/library/busybox") || (!has(kiri, "image", "busybox:latest") && pull("busybox")))
         && let Some(name) = helper_in_kiri()?
     {
@@ -449,7 +466,7 @@ enum Filled {
 /// read-only and says which have files in and which a copy left unfinished.
 fn kiri_states(names: &[String], img: &str) -> io::Result<Vec<(String, Filled)>> {
     let mut cmd = cli()?;
-    cmd.args(["--context", crate::flavor::CONTEXT.get(), "run", "--rm", "--network", "none", "--label", HELPER]);
+    cmd.args(on(crate::flavor::CONTEXT.get())).args(["run", "--rm", "--network", "none", "--label", HELPER]);
     for (i, n) in names.iter().enumerate() {
         cmd.arg("-v").arg(format!("{n}:/v/{i}:ro"));
     }
@@ -586,14 +603,14 @@ pub fn volume_with(source: &str, name: &str, force: bool) -> io::Result<()> {
     let reader = format!("kiri-import-{name}");
     let leftover = json_lines(ctx, &["inspect", "--type", "container", "--format", "{{json .Config.Labels}}", &reader]).unwrap_or_default();
     if leftover.first().is_some_and(|l| l["dev.kiri.import-helper"] == "1") {
-        let _ = cli()?.args(["--context", ctx, "rm", "-fv", &reader]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        let _ = cli()?.args(on(ctx)).args(["rm", "-fv", &reader]).stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
     // At a path no image can have a VOLUME of its own at or under.
     use std::hash::BuildHasher;
     let at = format!("/kiri-import-{:016x}", std::collections::hash_map::RandomState::new().hash_one(name));
     let mount = format!("type=volume,src={name},dst={at},readonly,volume-nocopy");
     let made = cli()?
-        .args(["--context", ctx, "create", "--name", &reader, "--pull", "never", "--network", "none", "--label", HELPER, "--entrypoint", &at, "--mount", &mount, &reader_image])
+        .args(on(ctx)).args(["create", "--name", &reader, "--pull", "never", "--network", "none", "--label", HELPER, "--entrypoint", &at, "--mount", &mount, &reader_image])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()?;
@@ -601,7 +618,7 @@ pub fn volume_with(source: &str, name: &str, force: bool) -> io::Result<()> {
         return Err(io::Error::other(format!("{ctx}: {}", String::from_utf8_lossy(&made.stderr).trim())));
     }
     let copied = copy_volume(ctx, &format!("{reader}:{at}/."), name, &img);
-    let _ = cli()?.args(["--context", ctx, "rm", "-v", &reader]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let _ = cli()?.args(on(ctx)).args(["rm", "-v", &reader]).stdout(Stdio::null()).stderr(Stdio::null()).status();
     copied.map_err(|e| io::Error::other(format!("{e}; {name} is unfinished in Kiri: the next import empties it and copies it again, replacing what is in it then")))
 }
 
@@ -613,7 +630,7 @@ fn copy_volume(ctx: &str, from: &str, name: &str, img: &str) -> io::Result<()> {
     let kiri = crate::flavor::CONTEXT.get();
     let dst_mount = format!("{name}:/to");
     let mut read = cli()?;
-    read.args(["--context", ctx, "cp", from, "-"]);
+    read.args(on(ctx)).args(["cp", from, "-"]);
     let mut write = cli()?;
     // Emptied in one pass, all but the mark (a folder by that name counts as
     // it); anything still there after, hidden names too, stops the copy with
@@ -622,9 +639,9 @@ fn copy_volume(ctx: &str, from: &str, name: &str, img: &str) -> io::Result<()> {
         r#"set -e; cd /to; if [ -e {m} ]; then find . -mindepth 1 -maxdepth 1 ! -name {m} -exec rm -rf -- {{}} + || true; for f in .[!.]* ..?* *; do if [ "$f" != {m} ] && {{ [ -e "$f" ] || [ -L "$f" ]; }}; then echo "could not empty the volume: $f is left" >&2; exit 1; fi; done; fi; touch {m}; tar -xpf -"#,
         m = UNFINISHED
     );
-    write.args(["--context", kiri, "run", "--rm", "-i", "--network", "none", "--label", HELPER, "-v", &dst_mount, "--pull", "never", "--entrypoint", "sh", img, "-c", &script]);
+    write.args(on(kiri)).args(["run", "--rm", "-i", "--network", "none", "--label", HELPER, "-v", &dst_mount, "--pull", "never", "--entrypoint", "sh", img, "-c", &script]);
     pipe(read, write, ctx, |from, to| retar(from, to, None))?;
-    let done = cli()?.args(["--context", kiri, "run", "--rm", "--network", "none", "--label", HELPER, "-v", &dst_mount, "--pull", "never", "--entrypoint", "rm", img, "-rf", "--", &format!("/to/{UNFINISHED}")]).stdout(Stdio::null()).stderr(Stdio::piped()).output()?;
+    let done = cli()?.args(on(kiri)).args(["run", "--rm", "--network", "none", "--label", HELPER, "-v", &dst_mount, "--pull", "never", "--entrypoint", "rm", img, "-rf", "--", &format!("/to/{UNFINISHED}")]).stdout(Stdio::null()).stderr(Stdio::piped()).output()?;
     if !done.status.success() {
         return Err(io::Error::other(format!("kiri: {}", String::from_utf8_lossy(&done.stderr).trim())));
     }
@@ -689,8 +706,11 @@ pub fn container_with(source: &str, name: &str, force: bool, joining: &[&str]) -
         mode = format!("container:{target}");
     }
     for (net, ep) in info["NetworkSettings"]["Networks"].as_object().into_iter().flatten().filter(|_| !mode.starts_with("container:")) {
-        if !["bridge", "host", "none", "default"].contains(&net.as_str()) {
-            let _ = cli()?.args(["--context", kiri, "network", "create", net]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        if !["bridge", "host", "none", "default"].contains(&net.as_str()) && !has(kiri, "network", net) {
+            // With its driver and labels: Compose won't take a project's
+            // network that lacks com.docker.compose.network.
+            let made = json_lines(ctx, &["network", "inspect", "--format", r#"{"driver":{{json .Driver}},"labels":{{json .Labels}}}"#, net])?;
+            let _ = cli()?.args(on(kiri)).args(network_create_args(net, made.first().unwrap_or(&Value::Null))).stdout(Stdio::null()).stderr(Stdio::null()).status();
         }
         // The source's own short ID is no name in Kiri.
         let short = info["Id"].as_str().unwrap_or("").get(..12).unwrap_or("").to_owned();
@@ -702,6 +722,28 @@ pub fn container_with(source: &str, name: &str, force: bool, joining: &[&str]) -
         return Err(io::Error::other(r.error()));
     }
     Ok(())
+}
+
+/// `network create` for `net` as the source has it: `made` is its driver
+/// and labels. Its subnet is left to Kiri, whose pool may hold the source's.
+fn network_create_args(net: &str, made: &Value) -> Vec<String> {
+    let mut args = vec!["network".to_owned(), "create".to_owned()];
+    if let Some(d) = made["driver"].as_str().filter(|d| !d.is_empty()) {
+        args.extend(["--driver".to_owned(), d.to_owned()]);
+    }
+    let mut labels: Vec<(&String, &Value)> = made["labels"].as_object().into_iter().flatten().collect();
+    labels.sort_by_key(|(k, _)| *k);
+    for (k, v) in labels {
+        args.extend(["--label".to_owned(), format!("{k}={}", v.as_str().unwrap_or(""))]);
+    }
+    args.push(net.to_owned());
+    args
+}
+
+/// Whether two paths are one file, links followed.
+#[cfg(target_os = "linux")]
+fn same_file(a: impl AsRef<std::path::Path>, b: impl AsRef<std::path::Path>) -> bool {
+    matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
 }
 
 /// The volumes a container has on the source, named and anonymous.
@@ -781,9 +823,14 @@ fn create_body(info: &Value, mode: &str, networks: Value) -> Value {
     body
 }
 
-/// Whether `ctx`'s engine answers.
+/// Whether `ctx`'s engine answers. Docker Engine's socket counts only while
+/// it is dockerd's: `kiri setup` links it to Kiri's own.
 fn answers(ctx: &str) -> bool {
-    cli().is_ok_and(|mut c| c.args(["--context", ctx, "version", "--format", "{{.Server.Version}}"]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()))
+    #[cfg(target_os = "linux")]
+    if ctx == ENGINE && crate::daemon::socket_path().is_ok_and(|ours| same_file(ENGINE_SOCK, &ours)) {
+        return false;
+    }
+    cli().is_ok_and(|mut c| c.args(on(ctx)).args(["version", "--format", "{{.Server.Version}}"]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()))
 }
 
 /// The engine to import from: the one named, or else the first that
@@ -802,13 +849,18 @@ fn pick(given: Option<&str>, answers: impl Fn(&str) -> bool) -> io::Result<&'sta
         }
         None => SOURCES.iter().map(|(c, _)| *c).find(|c| answers(c)).ok_or_else(|| {
             let names: Vec<&str> = SOURCES.iter().map(|(_, l)| *l).collect();
-            io::Error::other(format!("nothing to import from: {} isn't installed or running here", names.join(" or ")))
+            let names = match names.split_last() {
+                Some((last, [])) => (*last).to_owned(),
+                Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+                None => String::new(),
+            };
+            io::Error::other(format!("nothing to import from: {names} isn't installed or running here"))
         }),
     }
 }
 
 const KINDS: [&str; 3] = ["image", "volume", "container"];
-const USAGE: &str = "usage: kiri import [orbstack|desktop-linux] [--list | [--force] [image|volume|container NAME]]";
+const USAGE: &str = "usage: kiri import [orbstack|desktop-linux|docker] [--list | [--force] [image|volume|container NAME]]";
 
 /// What `kiri import` was asked to do.
 #[derive(Debug, PartialEq)]
@@ -847,7 +899,7 @@ fn parse<'a>(args: &[&'a str]) -> io::Result<(Option<&'a str>, Ask<'a>, bool)> {
     Ok((given, ask, force))
 }
 
-/// `kiri import [orbstack|desktop-linux] [--list | [--force] [image|volume|container NAME]]`:
+/// `kiri import [orbstack|desktop-linux|docker] [--list | [--force] [image|volume|container NAME]]`:
 /// one item, or every image, named volume and container Kiri lacks.
 pub fn run(args: &[String]) -> io::Result<()> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
@@ -924,7 +976,8 @@ mod tests {
         if cfg!(windows) {
             assert_eq!(pick(None, none).unwrap_err().to_string(), "nothing to import from: Docker Desktop isn't installed or running here");
         } else {
-            assert_eq!(pick(None, none).unwrap_err().to_string(), "nothing to import from: OrbStack or Docker Desktop isn't installed or running here");
+            let all = if cfg!(target_os = "linux") { "OrbStack, Docker Desktop or Docker Engine" } else { "OrbStack or Docker Desktop" };
+            assert_eq!(pick(None, none).unwrap_err().to_string(), format!("nothing to import from: {all} isn't installed or running here"));
             assert!(pick(Some("orbstack"), only_desktop).is_err());
             // Named: only that engine is asked.
             let asked = std::cell::RefCell::new(Vec::new());
@@ -944,10 +997,46 @@ mod tests {
     // A kind without exactly one name is a usage error, never "import
     // everything"; the source may be left out before a kind.
     #[test]
+    fn reaches_docker_engine_by_its_socket() {
+        use super::on;
+        assert_eq!(on("docker"), ["--host", "unix:///var/run/docker.sock"]);
+        assert_eq!(on("orbstack"), ["--context", "orbstack"]);
+        assert_eq!(on("kiri"), ["--context", "kiri"]);
+        assert_eq!(super::SOURCES.iter().any(|(c, _)| *c == "docker"), cfg!(target_os = "linux"));
+    }
+
+    #[test]
+    fn makes_a_network_with_its_compose_labels() {
+        let made = serde_json::json!({"driver": "bridge", "labels": {"com.docker.compose.project": "rimgo-local", "com.docker.compose.network": "default"}});
+        assert_eq!(
+            super::network_create_args("rimgo-local_default", &made),
+            ["network", "create", "--driver", "bridge", "--label", "com.docker.compose.network=default", "--label", "com.docker.compose.project=rimgo-local", "rimgo-local_default"]
+        );
+        assert_eq!(super::network_create_args("n", &serde_json::Value::Null), ["network", "create", "n"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linked_socket_is_the_same_file() {
+        let dir = std::env::temp_dir().join(format!("kiri-import-same-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (ours, link, other) = (dir.join("ours.sock"), dir.join("docker.sock"), dir.join("other.sock"));
+        std::fs::write(&ours, "").unwrap();
+        std::fs::write(&other, "").unwrap();
+        std::os::unix::fs::symlink(&ours, &link).unwrap();
+        assert!(super::same_file(&link, &ours));
+        assert!(!super::same_file(&other, &ours));
+        assert!(!super::same_file(dir.join("gone.sock"), &ours));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn parses_what_to_import() {
         use super::{Ask, parse};
         assert_eq!(parse(&[]).unwrap(), (None, Ask::Everything, false));
         assert_eq!(parse(&["orbstack"]).unwrap(), (Some("orbstack"), Ask::Everything, false));
+        assert_eq!(parse(&["docker", "--list"]).unwrap(), (Some("docker"), Ask::List, false));
         assert_eq!(parse(&["--list"]).unwrap(), (None, Ask::List, false));
         assert_eq!(parse(&["orbstack", "--list"]).unwrap(), (Some("orbstack"), Ask::List, false));
         assert_eq!(parse(&["image", "nginx"]).unwrap(), (None, Ask::One("image", "nginx"), false));
