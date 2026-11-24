@@ -122,6 +122,23 @@ pub fn host_dns() -> Vec<[u8; 4]> {
     if direct.is_empty() { parse("/run/systemd/resolve/resolv.conf") } else { direct }
 }
 
+/// What the agent forwards the embedded DNS's lookups to: [`host_dns`], or,
+/// when the host names only resolvers on its own loopback and no list of
+/// upstreams beside them (dnsmasq, blocky or unbound at 127.0.0.1, without
+/// systemd-resolved), those. The agent asks from the host's network
+/// namespace, where they answer, as Docker's embedded DNS does; a
+/// container's resolv.conf never names them ([`host_dns`] is what it gets).
+pub fn host_forward_dns() -> Vec<[u8; 4]> {
+    forward_servers(host_dns(), &std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default())
+}
+
+fn forward_servers(host: Vec<[u8; 4]>, resolv_conf: &str) -> Vec<[u8; 4]> {
+    if !host.is_empty() {
+        return host;
+    }
+    resolv_conf.lines().filter_map(|l| l.strip_prefix("nameserver")).filter_map(|ip| ip.trim().parse::<std::net::Ipv4Addr>().ok()).filter(|ip| ip.is_loopback()).map(|ip| ip.octets()).collect()
+}
+
 /// A resolv.conf's IPv4 nameservers but loopback ones (127.0.0.0/8). An
 /// address of this machine's on another interface, or on `lo` outside
 /// 127/8 (WSL's 10.255.255.254), is kept: `net::local_resolver` tells it.
@@ -136,6 +153,18 @@ fn nameservers(text: &str) -> Vec<[u8; 4]> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn forwards_to_a_loopback_resolver_only_when_there_is_nothing_else() {
+        // Void, Alpine, Arch with blocky or dnsmasq: 127.0.0.1 is all there is.
+        assert_eq!(super::forward_servers(Vec::new(), "nameserver 127.0.0.1\n"), [[127, 0, 0, 1]]);
+        assert_eq!(super::forward_servers(Vec::new(), "nameserver 127.0.0.1\nnameserver ::1\nnameserver 127.0.2.1\n"), [[127, 0, 0, 1], [127, 0, 2, 1]]);
+        // systemd-resolved's upstreams, or a real server, win over the stub.
+        assert_eq!(super::forward_servers(vec![[192, 168, 1, 1]], "nameserver 127.0.0.53\n"), [[192, 168, 1, 1]]);
+        assert!(super::forward_servers(Vec::new(), "").is_empty());
+        // What a container's resolv.conf is built from still has none.
+        assert!(super::nameservers("nameserver 127.0.0.1\n").is_empty());
+    }
+
     #[test]
     fn host_resolvers_skip_loopback_ones_but_keep_wsls() {
         // systemd-resolved's stub: its upstreams are read instead.

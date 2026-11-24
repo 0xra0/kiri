@@ -79,6 +79,9 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
     // host; in the VM, TCP ones reached over the NAT network).
     let mut published: Vec<(String, super::netlink::Dnat)> = Vec::new();
     let host_dns = if host_process { super::transport::host_dns() } else { Vec::new() };
+    // Where the embedded DNS sends lookups: host_dns, or the host's own
+    // loopback resolvers when it names nothing else (never a resolv.conf's).
+    let host_forward = if host_process { super::transport::host_forward_dns() } else { Vec::new() };
     let mut dhcp: Option<Dhcp> = if host_process {
         if let Err(e) = net::host_uplink() {
             eprintln!("kiri-init: no uplink: {e}");
@@ -325,7 +328,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 continue;
             }
             if dns.owns(pfd.fd) {
-                let upstream = dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns[..], |l| &l.dns);
+                let upstream = dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_forward[..], |l| &l.dns);
                 dns.on_readable(pfd.fd, upstream);
                 continue;
             }
